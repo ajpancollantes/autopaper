@@ -1,128 +1,188 @@
 import streamlit as st
 import google.generativeai as genai
-from typing import List, Dict
-import json
 
-# --- CONFIGURATION ---
-st.set_page_config(page_title="Math Research Copilot", layout="wide")
+# ---------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------
 
-# Sidebar for API Key
-api_key = st.sidebar.text_input("Enter Google Gemini API Key", type="password")
+st.set_page_config(page_title="AI Peer Review & Repair", layout="wide")
+api_key = st.sidebar.text_input("Enter Gemini API Key:", type="password")
+iterations = st.sidebar.number_input("Referee-Author Iterations:", min_value=1, max_value=5, value=1)
 
 if not api_key:
-    st.warning("Please enter your API Key in the sidebar to start.")
+    st.warning("Enter your API Key to begin.")
     st.stop()
 
-# Configure Gemini
 genai.configure(api_key=api_key)
 
-# --- DEFINING THE AGENTS ---
-
-def get_gemini_response(prompt, temperature=0.7):
-    model = genai.GenerativeModel('gemini-1.5-flash') # 'Flash' is fast and free
+def ask_model(system_instruction, prompt, temperature=0.3):
+    """
+    Unified wrapper for Gemini calls.
+    Using gemini-2.0-flash (or 1.5-flash) is recommended for speed/cost 
+    in iterative loops, but 1.5-pro is better for complex math logic.
+    """
+    model = genai.GenerativeModel(
+        model_name="gemini-1.5-flash", # Changed to standard stable model name
+        system_instruction=system_instruction
+    )
     response = model.generate_content(
         prompt,
-        generation_config=genai.types.GenerationConfig(temperature=temperature)
+        generation_config=genai.types.GenerationConfig(
+            temperature=temperature
+        )
     )
     return response.text
 
-def agent_generator(context: str, current_ideas: List[str]) -> str:
-    prompt = f"""
-    You are a creative mathematical researcher.
-    Original Context: "{context}"
-    Current Accepted Ideas: {current_ideas}
+# ---------------------------------------------------------
+#  REFEREE AGENTS ( The Critics )
+# ---------------------------------------------------------
+
+def agent_referee_novelty(tex_content: str) -> str:
+    """Evaluates Novelty, Interestingness, and General Structure."""
+    sys_prompt = """
+    You are a Senior Editor at a top mathematics journal. 
+    1. Evaluate the NOVELTY and INTERESTINGNESS of the paper.
+    2. Check the GENERAL STRUCTURE (Does it have Intro, Prelims, Main Results?).
     
-    TASK: Propose ONE new, novel research follow-up or conjecture based on the context.
-    Focus on creative connections. Keep it concise (3-4 sentences).
+    IMPORTANT: If the paper is not novel or structural nonsense, start your response with "FAIL: [Reason]". 
+    Otherwise, start with "PASS" and provide a brief report.
     """
-    return get_gemini_response(prompt, temperature=0.9)
+    return ask_model(sys_prompt, f"Evaluate this paper:\n{tex_content}", 0.2)
 
-def agent_critic(idea: str, context: str) -> Dict:
-    prompt = f"""
-    You are a strict mathematics reviewer.
-    Context: "{context}"
-    Proposed Idea: "{idea}"
-    
-    Evaluate this idea on:
-    1. Novelty (Is it new?)
-    2. Correctness (Does it make mathematical sense?)
-    3. Feasibility (Is it solvable?)
-    
-    Output ONLY valid JSON in this format:
-    {{
-        "score": <integer 1-10>,
-        "critique": "<short text critique>",
-        "improved_version": "<rewrite the idea to be more rigorous>"
-    }}
+def agent_referee_org(tex_content: str) -> str:
+    """Evaluates the organization and flow."""
+    sys_prompt = """
+    You are a Referee focused on exposition. 
+    Evaluate the organization: Section ordering, logical flow between paragraphs, and clarity.
+    Output a bulleted list of organizational weaknesses.
     """
-    try:
-        response = get_gemini_response(prompt, temperature=0.1)
-        # Clean up JSON formatting if the model adds markdown
-        cleaned_response = response.replace("```json", "").replace("```", "")
-        return json.loads(cleaned_response)
-    except:
-        return {"score": 0, "critique": "Error parsing critic response", "improved_version": idea}
+    return ask_model(sys_prompt, f"Critique the organization:\n{tex_content}", 0.2)
 
-# --- THE APP UI ---
+def agent_referee_proofs(tex_content: str) -> str:
+    """
+    Acts as the 'Extractor' and 'Verifier' sub-agents.
+    Extracts statements/proofs and checks correctness.
+    """
+    sys_prompt = """
+    You are a meticulous Math Referee. 
+    1. Identify every Theorem/Lemma and its Proof.
+    2. Check the correctness of each proof step-by-step.
+    3. If a proof is correct, say "Theorem X: Correct".
+    4. If a proof is incorrect, explain exactly WHERE the logic breaks.
+    """
+    return ask_model(sys_prompt, f"Verify the proofs in this text:\n{tex_content}", 0.1)
 
-st.title("🎓 Autonomous Research Copilot")
-st.markdown("Paste your math abstract/notes below. The AI will brainstorm and refine ideas recursively.")
+# ---------------------------------------------------------
+#  AUTHOR AGENTS ( The Repair Team )
+# ---------------------------------------------------------
 
-original_text = st.text_area("Your Notes/Abstract:", height=150)
-iterations = st.slider("Number of Brainstorming Loops", 1, 5, 3)
+def agent_author_narrative(report: str, tex_content: str) -> str:
+    """Expert in narrative, intros, and conclusions."""
+    sys_prompt = """
+    You are an Expert Mathematical Writer. 
+    Based on the Referee's report, rewrite the Introduction, Conclusion, and transitional text.
+    Do NOT change the Theorems or Proofs (math content), only the narrative structure.
+    """
+    return ask_model(sys_prompt, f"Referee Report:\n{report}\n\nOriginal Text:\n{tex_content}", 0.4)
 
-if st.button("Start Research Loop") and original_text:
+def agent_author_proof_fixer(proof_report: str, tex_content: str) -> str:
+    """Expert in writing proofs. Only fixes flawed proofs."""
+    sys_prompt = """
+    You are a Mathematician specializing in fixing proofs.
+    Read the Referee's proof report. If a proof is marked as flawed, rewrite that specific Theorem and Proof entirely.
+    If the proof was correct, leave it exactly as is.
+    Output the corrected LaTeX segments for the flawed parts.
+    """
+    return ask_model(sys_prompt, f"Proof Report:\n{proof_report}\n\nOriginal Text:\n{tex_content}", 0.1)
+
+def agent_author_integrator(narrative_fix: str, proof_fix: str, original_tex: str) -> str:
+    """Integrates responses into a coherent whole."""
+    sys_prompt = """
+    You are the Lead Author. 
+    Integrate the improved narrative text and the corrected proofs into a single, coherent LaTeX document.
+    Ensure all packages and document structure are preserved.
+    """
+    query = f"""
+    1. Improved Narrative: {narrative_fix}
+    2. Corrected Proofs: {proof_fix}
+    3. Original Source: {original_tex}
     
-    research_log = []
-    final_ideas = []
+    Output the full, compiled, valid LaTeX file.
+    """
+    return ask_model(sys_prompt, query, 0.1)
+
+# ---------------------------------------------------------
+# STREAMLIT UI & LOGIC
+# ---------------------------------------------------------
+
+st.title("🤖🎓 Agentic Peer Review System")
+st.markdown("### Upload your LaTeX -> Referee checks -> Author fixes")
+
+initial_tex = st.text_area("Paste your LaTeX Paper:", height=300, placeholder="\\documentclass{article}...")
+run = st.button("🚀 Start Review Cycle")
+
+if run and initial_tex.strip():
+    current_tex = initial_tex
     
-    status_box = st.empty()
-    
-    # --- THE LOOP ---
+    # Progress container
+    log = st.empty()
+
     for i in range(iterations):
-        status_box.info(f"🔄 Iteration {i+1}/{iterations}: Generating ideas...")
+        st.markdown(f"--- \n ### 🔄 Iteration {i+1} / {iterations}")
         
-        # 1. Generator generates an idea
-        raw_idea = agent_generator(original_text, final_ideas)
-        
-        # 2. Critic evaluates it
-        status_box.info(f"⚖️ Iteration {i+1}/{iterations}: Critic is reviewing...")
-        review = agent_critic(raw_idea, original_text)
-        
-        # 3. Decision Logic
-        if review['score'] >= 7:
-            status_box.success(f"✅ Idea Accepted! (Score: {review['score']}/10)")
-            final_ideas.append(review['improved_version'])
-            # Update context for next loop so it doesn't repeat
-            original_text += f"\n\n[Expansion {i+1}]: {review['improved_version']}"
-        else:
-            status_box.warning(f"❌ Idea Rejected (Score: {review['score']}/10): {review['critique']}")
-        
-        # Log for display
-        research_log.append({
-            "iteration": i+1,
-            "raw_idea": raw_idea,
-            "score": review['score'],
-            "critique": review['critique'],
-            "accepted": review['score'] >= 7
-        })
+        # --- REFEREE PHASE ---
+        with st.status(f"Referee Phase (Round {i+1})", expanded=True):
+            
+            # Step 1: Novelty & Structure
+            st.write("🕵️ checking novelty...")
+            novelty_report = agent_referee_novelty(current_tex)
+            
+            if novelty_report.strip().upper().startswith("FAIL"):
+                st.error("⛔ Paper rejected by Gatekeeper Agent.")
+                st.error(novelty_report)
+                st.stop() # Return to human
+            
+            st.success("Novelty/Structure passed.")
+            with st.expander("Novelty Report"):
+                st.write(novelty_report)
 
-    status_box.empty()
+            # Step 2: Organization
+            st.write("📐 checking organization...")
+            org_report = agent_referee_org(current_tex)
+            
+            # Step 3: Proofs
+            st.write("🧮 checking proofs...")
+            proof_report = agent_referee_proofs(current_tex)
+            with st.expander("Proof Analysis"):
+                st.write(proof_report)
+
+            full_referee_report = f"""
+            NOVELTY REPORT: {novelty_report}
+            ORGANIZATION REPORT: {org_report}
+            PROOF REPORT: {proof_report}
+            """
+
+        # --- AUTHOR PHASE ---
+        with st.status(f"Author Phase (Round {i+1})", expanded=True):
+            st.write("✍️ Narrative Expert rewriting...")
+            narrative_fix = agent_author_narrative(full_referee_report, current_tex)
+            
+            st.write("🧠 Proof Expert fixing logic...")
+            proof_fix = agent_author_proof_fixer(proof_report, current_tex)
+            
+            st.write("🔗 Lead Author integrating...")
+            current_tex = agent_author_integrator(narrative_fix, proof_fix, current_tex)
+            
+            st.success(f"Iteration {i+1} complete.")
+
+    # --- FINAL OUTPUT ---
+    st.markdown("---")
+    st.subheader("🎉 Final Improved Paper")
+    st.code(current_tex, language="latex")
     
-    # --- RESULTS DISPLAY ---
-    col1, col2 = st.columns([1, 1])
-    
-    with col1:
-        st.subheader("📝 Final Expanded Paper Plan")
-        st.write(original_text)
-        
-    with col2:
-        st.subheader("🕵️ Process Log")
-        for log in research_log:
-            with st.expander(f"Loop {log['iteration']} - Score: {log['score']}"):
-                st.markdown(f"**Draft:** {log['raw_idea']}")
-                st.markdown(f"**Critique:** {log['critique']}")
-                if log['accepted']:
-                    st.success("Added to paper")
-                else:
-                    st.error("Discarded")
+    st.download_button(
+        label="📥 Download .tex file",
+        data=current_tex,
+        file_name="improved_paper.tex",
+        mime="text/plain"
+    )
