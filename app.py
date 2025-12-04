@@ -22,7 +22,7 @@ def ask_model(system_instruction, prompt, temperature=0.3):
     in iterative loops, but 1.5-pro is better for complex math logic.
     """
     model = genai.GenerativeModel(
-        model_name="gemini-1.5-flash", # Changed to standard stable model name
+        model_name="gemini-2.5-flash", # Changed to standard stable model name
         system_instruction=system_instruction
     )
     response = model.generate_content(
