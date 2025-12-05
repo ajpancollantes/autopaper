@@ -258,6 +258,10 @@ PROOF REPORT: {proof_report}
 
             st.success(f"Iteration {i+1} finished.")
 
+            # Show intermediate result
+            with st.expander(f"📄 View Resulting Paper (Iteration {i+1})"):
+                st.code(current_tex, language="latex")
+
     # --- FINAL OUTPUT ---
     st.markdown("---")
     st.subheader("Final Improved Paper")
