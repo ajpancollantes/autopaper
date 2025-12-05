@@ -43,8 +43,8 @@ def ask_model(system_instruction, prompt, temperature=0.3):
 
 def agent_referee_novelty(tex_content: str) -> str:
     sys_prompt = """
-You are a Senior Editor at a top mathematics journal.
-1. Evaluate the NOVELTY and INTERESTINGNESS.
+You are a honest but demanding Senior Editor at a top mathematics journal.
+1. Evaluate the NOVELTY and INTERESTINGNESS. 
 2. Check the GENERAL STRUCTURE.
 IMPORTANT: If the paper is not novel or nonsense, start with "FAIL: [Reason]".
 Otherwise, start with "PASS" and provide a brief report.
@@ -53,13 +53,13 @@ Otherwise, start with "PASS" and provide a brief report.
 
 
 def agent_referee_org(tex_content: str) -> str:
-    sys_prompt = "You are a Referee. List organizational weaknesses and flow issues."
+    sys_prompt = "You are a demanding Referee. List organizational weaknesses and flow issues."
     return ask_model(sys_prompt, f"Critique organization:\n{tex_content}", 0.2)
 
 
 def agent_referee_proofs(tex_content: str) -> str:
     sys_prompt = """
-You are a Math Referee.
+You are a demanding Math Referee.
 Identify every Theorem/Proof. Check correctness step-by-step.
 If flawed, explain exactly WHERE the logic breaks.
 """
@@ -75,7 +75,8 @@ def agent_author_narrative(full_report: str, tex_content: str) -> str:
 You are an Expert Mathematical Writer.
 Read the Referee Report below. Ignore math correctness comments.
 Focus on: Introduction, Conclusion, Structure, and Textual Flow.
-Rewrite the narrative parts of the paper based on the feedback.
+Rewrite the narrative parts of the paper based on the feedback. 
+For the references, create placeholders. Those will be filled later.
 """
     return ask_model(sys_prompt, f"Referee Report:\n{full_report}\n\nOriginal Text:\n{tex_content}", 0.4)
 
@@ -90,6 +91,21 @@ If no specific math errors are found, output "NO_CHANGES".
     return ask_model(sys_prompt, f"Referee Report:\n{full_report}\n\nOriginal Text:\n{tex_content}", 0.1)
 
 
+def agent_author_final_polish(tex_content: str) -> str:
+    """
+    Reads the entire integrated document to fix coherence, flow, and syntax artifacts.
+    """
+    sys_prompt = """
+You are the Lead Author and LaTeX Expert.
+Your task is to REVIEW the entire document for coherence and syntax.
+1. Fix any broken LaTeX structure (mismatched braces, environments, duplicate preambles).
+2. Smooth out transitions between the introduction and the main body.
+3. Remove any "trash" text or artifacts (like "Here is the fixed proof:" or duplicate \begin{document}) that might have been pasted in.
+4. Output ONLY the complete, compilable LaTeX code. Do not output markdown code blocks.
+"""
+    return ask_model(sys_prompt, f"Fix and Polish this LaTeX document:\n{tex_content}", 0.1)
+
+
 # Helper: safely replace LaTeX environment blocks
 def replace_environment_block(tex: str, env: str, old_block: str, new_block: str) -> str:
     """
@@ -100,9 +116,6 @@ def replace_environment_block(tex: str, env: str, old_block: str, new_block: str
     pattern = r"(\\begin\{" + re.escape(env) + r"\}.*?\\end\{" + re.escape(env) + r"\})"
     
     # FIX: Use a lambda function for the replacement.
-    # When passing a string directly to re.sub, it processes escape sequences (like \t, \n, \1).
-    # Since LaTeX contains many backslashes, this causes a "bad escape" error.
-    # Using lambda m: new_block treats the replacement string as raw text.
     return re.sub(pattern, lambda m: new_block, tex, count=1, flags=re.S)
 
 
@@ -112,7 +125,6 @@ def replace_all_corrected_proofs(tex: str, proof_fix: str) -> str:
     Find corrected environment blocks in the proof_fix text (expected to include full
     \\begin{<env>} ... \\end{<env>} chunks) and replace the corresponding environment
     blocks in the original tex. Matching is done by environment name.
-    Robust to bad AI output: if regex fails or no blocks are found, returns original tex.
     """
     if not proof_fix or proof_fix.strip().upper() == "NO_CHANGES":
         return tex
@@ -121,22 +133,17 @@ def replace_all_corrected_proofs(tex: str, proof_fix: str) -> str:
     try:
         corrected_blocks = re.findall(r"(\\begin\{.*?\}.*?\\end\{.*?\})", proof_fix, flags=re.S)
     except re.error:
-        # If the AI produced something that breaks the regex engine, do nothing.
         return tex
 
     if not corrected_blocks:
         return tex
 
-    # For each corrected block, determine its environment name and replace the first matching
-    # environment of the same name in the original tex.
     for block in corrected_blocks:
         m = re.match(r'\\begin\{([^}]+)\}', block)
         if not m:
-            # Can't determine env name — skip this block
             continue
         env_name = m.group(1)
 
-        # Find matching environment blocks in original tex with the same env_name
         try:
             orig_pattern = r"(\\begin\{" + re.escape(env_name) + r"\}.*?\\end\{" + re.escape(env_name) + r"\})"
             original_blocks = re.findall(orig_pattern, tex, flags=re.S)
@@ -144,7 +151,6 @@ def replace_all_corrected_proofs(tex: str, proof_fix: str) -> str:
             original_blocks = []
 
         if original_blocks:
-            # Replace the first occurrence for that env
             old_block = original_blocks[0]
             tex = replace_environment_block(tex, env_name, old_block, block)
 
@@ -154,13 +160,8 @@ def replace_all_corrected_proofs(tex: str, proof_fix: str) -> str:
 def agent_author_integrator(narrative_fix: str, proof_fix: str, original_tex: str) -> str:
     """
     Integrate improved narrative and corrected proofs into the original document.
-    Integration strategy:
-      - If original_tex contains the marker '%IMPROVED_NARRATIVE%', replace it.
-      - Else, insert narrative_fix immediately after \begin{document} if present.
-      - Else, prepend narrative_fix.
-    Then replace corrected proofs by matching environment names.
     """
-    # Step 1: place the narrative in a safe way (do not clobber the original by default)
+    # Step 1: place the narrative
     if "%IMPROVED_NARRATIVE%" in original_tex:
         merged = original_tex.replace("%IMPROVED_NARRATIVE%", narrative_fix)
     else:
@@ -169,10 +170,9 @@ def agent_author_integrator(narrative_fix: str, proof_fix: str, original_tex: st
             insert_pos = begin_doc.end()
             merged = original_tex[:insert_pos] + "\n\n" + narrative_fix + "\n\n" + original_tex[insert_pos:]
         else:
-            # No clear insertion point: prepend the narrative to preserve the original
             merged = narrative_fix + "\n\n" + original_tex
 
-    # Step 2: replace proofs (robustly)
+    # Step 2: replace proofs
     merged = replace_all_corrected_proofs(merged, proof_fix)
     return merged
 
@@ -245,6 +245,16 @@ PROOF REPORT: {proof_report}
 
             st.write("Lead Author integrating...")
             current_tex = agent_author_integrator(narrative_fix, proof_fix, current_tex)
+
+            # NEW: Final Polish Step
+            st.write("Final Polish: Reviewing coherence and syntax...")
+            polished_tex = agent_author_final_polish(current_tex)
+
+            # Basic error checking to ensure we don't wipe the file on an API error
+            if "Error" in polished_tex and len(polished_tex) < 200:
+                st.warning("Polishing failed due to API error. Retaining integrated version.")
+            else:
+                current_tex = polished_tex
 
             st.success(f"Iteration {i+1} finished.")
 
