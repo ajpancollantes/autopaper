@@ -15,15 +15,14 @@ with st.sidebar:
     iterations = st.number_input("Referee-Author Iterations:", min_value=1, max_value=5, value=1)
     st.info("Note: If you provide a manual report, it consumes the first iteration.")
 
-    if not api_key:
-        st.warning("Enter your API Key to begin.")
-        st.stop()
+if not api_key:
+    st.warning("Enter your API Key to begin.")
+    st.stop()
 
 genai.configure(api_key=api_key)
 
 
 def ask_model(system_instruction, prompt, temperature=0.3):
-    """Call the Gemini model (thin wrapper)."""
     model = genai.GenerativeModel(
         model_name="gemini-2.5-flash",
         system_instruction=system_instruction
@@ -33,8 +32,7 @@ def ask_model(system_instruction, prompt, temperature=0.3):
             prompt,
             generation_config=genai.types.GenerationConfig(temperature=temperature)
         )
-        # Depending on SDK version the attribute might differ; keep as .text for now.
-        return getattr(response, "text", str(response))
+        return response.text
     except Exception as e:
         return f"Error connecting to API: {e}"
 
@@ -93,57 +91,147 @@ If no specific math errors are found, output "NO_CHANGES".
 
 
 # Helper: safely replace LaTeX environment blocks
-def replace_environment_block(tex: str, env: str, new_block: str) -> str:
+def replace_environment_block(tex: str, env: str, old_block: str, new_block: str) -> str:
     """
-    Replace the first occurrence of a LaTeX environment "env" in tex
-    with new_block. If no such environment is found, returns tex unchanged.
+    Replace the first occurrence of a LaTeX environment block with a new one.
     """
     env_escaped = re.escape(env)
-    pattern = r"(\\begin\{" + env_escaped + r"\}.*?\\end\{" + env_escaped + r"\})"
+    pattern = r"(\begin{" + env_escaped + r"}.*?\end{" + env_escaped + r"})"
     return re.sub(pattern, new_block, tex, count=1, flags=re.S)
 
 
+# Integrate narrative and proof fixes into the original LaTeX
 def replace_all_corrected_proofs(tex: str, proof_fix: str) -> str:
-    """
-    proof_fix is expected to contain one or more LaTeX environment blocks,
-    e.g. \begin{theorem}...\end{theorem} or \begin{proof}...\end{proof}.
-    For each such block in proof_fix, replace the first occurrence of the
-    same environment in tex with that corrected block.
-    """
     if proof_fix.strip().upper() == "NO_CHANGES":
         return tex
 
-    # Find all full \begin{...}\end{...} blocks in proof_fix
-    corrected_blocks = re.findall(r"(\\begin\{[^\}]+\}.*?\\end\{[^\}]+\})", proof_fix, flags=re.S)
+    # Assume proofs are separated by \begin{theorem} ... \end{theorem} or similar
+    # We replace one by one based on AI output
+    corrected_blocks = re.findall(r"(\begin{.*?}.*?\end{.*?})", proof_fix, flags=re.S)
     if not corrected_blocks:
         return tex
 
-    updated_tex = tex
-    for block in corrected_blocks:
-        m = re.search(r"\\begin\{([^\}]+)\}", block)
-        if not m:
+    # Find original environment blocks in the original tex
+    original_blocks = re.findall(r"(\begin{.*?}.*?\end{.*?})", tex, flags=re.S)
+    for i, block in enumerate(corrected_blocks):
+        try:
+            env_name = block.split('{')[1].split('}')[0]
+        except Exception:
+            # fallback: skip malformed block
             continue
-        env_name = m.group(1)
-        # Replace the first occurrence of this env in the original tex
-        updated_tex = replace_environment_block(updated_tex, env_name, block)
 
-    return updated_tex
+        if original_blocks:
+            old_block = original_blocks[0]  # replace first matched original block for simplicity
+            tex = replace_environment_block(tex, env_name, old_block, block)
+
+    return tex
 
 
 def agent_author_integrator(narrative_fix: str, proof_fix: str, original_tex: str) -> str:
-    """
-    Integrate the improved narrative and corrected proofs into original_tex.
+    sys_prompt = """
+You are the Lead Author.
+Integrate the improved narrative text and the corrected proofs into the original document.
+1. Replace old narrative with 'Improved Narrative'.
+2. If 'Corrected Proofs' is not NO_CHANGES, replace the specific theorems/proofs.
+Output the full, compiled, valid LaTeX file.
+"""
+    # Step 1: replace narrative (simple global replacement for simplicity)
+    merged = original_tex.replace(original_tex, narrative_fix)
+    # Step 2: replace proofs
+    merged = replace_all_corrected_proofs(merged, proof_fix)
+    return merged
 
-    Heuristics used:
-      - Replace the 'Introduction' section if found (first \section{Introduction} ... until next \section or \end{document}).
-      - Otherwise, prepend the improved narrative before the document body.
-      - Replace corrected proof/theorem environments using replace_all_corrected_proofs().
-    """
-    merged = original_tex
 
-    # Try to replace the Introduction section (heuristic)
-    intro_pattern = re.compile(r"(\\section\{Introduction\}.*?)(?=\\section\{|\\end\{document\})", flags=re.S)
-    if intro_pattern.search(merged):
-        merged = intro_pattern.sub(narrative_fix, merged, count=1)
-    else:
-        # If no clear Introduction, try t
+# ---------------------------------------------------------
+# STREAMLIT UI & LOGIC
+# ---------------------------------------------------------
+
+st.title("🤖🎓 Agentic Peer Review System")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    initial_tex = st.text_area("1. Paste your LaTeX Paper:", height=300, placeholder="\\documentclass{article}...")
+
+with col2:
+    human_referee_input = st.text_area(
+        "2. (Optional) Your Referee Report:",
+        height=300,
+        placeholder="E.g., 'Theorem 3 is incorrect because...' or 'The introduction is too vague.'\n\nIf you fill this in, the first iteration will focus ONLY on addressing your comments."
+    )
+
+run = st.button("🚀 Start Review Cycle", type="primary")
+
+if run and initial_tex.strip():
+    current_tex = initial_tex
+
+    for i in range(iterations):
+        st.markdown(f"--- \n ### 🔄 Iteration {i+1} / {iterations}")
+
+        full_referee_report = ""
+        is_human_round = (i == 0 and human_referee_input.strip() != "")
+
+        # --- REFEREE PHASE ---
+        with st.status(f"Referee Phase (Round {i+1})", expanded=True) as status:
+
+            if is_human_round:
+                st.info("👤 Using Human Referee Report for this round.")
+                full_referee_report = human_referee_input
+
+            else:
+                st.write("🕵️ AI checking novelty...")
+                novelty_report = agent_referee_novelty(current_tex)
+
+                if novelty_report.strip().upper().startswith("FAIL"):
+                    st.error("⛔ Paper rejected by Gatekeeper Agent.")
+                    st.error(novelty_report)
+                    status.update(label="Referee Phase Failed", state="error")
+                    st.stop()
+
+                st.write("📐 AI checking organization...")
+                org_report = agent_referee_org(current_tex)
+
+                st.write("🧮 AI checking proofs...")
+                proof_report = agent_referee_proofs(current_tex)
+
+                full_referee_report = f"""
+            NOVELTY REPORT: {novelty_report}
+            ORGANIZATION REPORT: {org_report}
+            PROOF REPORT: {proof_report}
+            """
+
+                with st.expander("View AI Generated Report"):
+                    st.write(full_referee_report)
+
+            status.update(label="Referee Phase Complete", state="complete")
+
+        # --- AUTHOR PHASE ---
+        with st.status(f"Author Phase (Round {i+1})", expanded=True) as status:
+            st.write("✍️ Narrative Expert rewriting...")
+            narrative_fix = agent_author_narrative(full_referee_report, current_tex)
+
+            st.write("🧠 Proof Expert fixing logic...")
+            proof_fix = agent_author_proof_fixer(full_referee_report, current_tex)
+
+            st.write("🔗 Lead Author integrating...")
+            current_tex = agent_author_integrator(narrative_fix, proof_fix, current_tex)
+
+            status.update(label="Author Phase Complete", state="complete")
+            st.success(f"Iteration {i+1} finished.")
+
+    # --- FINAL OUTPUT ---
+    st.markdown("---")
+    st.subheader("🎉 Final Improved Paper")
+
+    tab1, tab2 = st.tabs(["Rendered Code", "Raw LaTeX"])
+    with tab1:
+        st.code(current_tex, language="latex")
+    with tab2:
+        st.text(current_tex)
+
+    st.download_button(
+        label="📥 Download .tex file",
+        data=current_tex,
+        file_name="improved_paper.tex",
+        mime="text/plain"
+    )
