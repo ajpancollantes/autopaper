@@ -98,7 +98,12 @@ def replace_environment_block(tex: str, env: str, old_block: str, new_block: str
     """
     # Build a regex that matches literal \begin{env} ... \end{env}
     pattern = r"(\\begin\{" + re.escape(env) + r"\}.*?\\end\{" + re.escape(env) + r"\})"
-    return re.sub(pattern, new_block, tex, count=1, flags=re.S)
+    
+    # FIX: Use a lambda function for the replacement.
+    # When passing a string directly to re.sub, it processes escape sequences (like \t, \n, \1).
+    # Since LaTeX contains many backslashes, this causes a "bad escape" error.
+    # Using lambda m: new_block treats the replacement string as raw text.
+    return re.sub(pattern, lambda m: new_block, tex, count=1, flags=re.S)
 
 
 # Integrate narrative and proof fixes into the original LaTeX
